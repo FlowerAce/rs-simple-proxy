@@ -1,5 +1,3 @@
-use futures::future;
-use futures::future::TryFutureExt;
 use hyper::client::connect::HttpConnector;
 use hyper::service::Service;
 use hyper::{Body, Client, Request, Response};
@@ -16,6 +14,8 @@ use std::{
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 
+use hyper_tls::HttpsConnector;
+
 use crate::proxy::middleware::MiddlewareResult::*;
 use crate::Middlewares;
 
@@ -23,7 +23,7 @@ use crate::Middlewares;
 pub type State = Arc<Mutex<HashMap<(String, u64), String>>>;
 
 pub struct ProxyService {
-    client: Client<HttpConnector>,
+    client: Client<HttpsConnector<HttpConnector>>,
     middlewares: Middlewares,
     state: State,
     remote_addr: SocketAddr,
@@ -56,10 +56,12 @@ impl Service<Request<hyper::Body>> for ProxyService {
 
         // Create references for future callbacks
         // references are moved in each chained future (map,then..)
+        let mws_early = Arc::clone(&self.middlewares);
         let mws_failure = Arc::clone(&self.middlewares);
         let mws_success = Arc::clone(&self.middlewares);
         let mws_after_success = Arc::clone(&self.middlewares);
         let mws_after_failure = Arc::clone(&self.middlewares);
+        let state_early = Arc::clone(&self.state);
         let state_failure = Arc::clone(&self.state);
         let state_success = Arc::clone(&self.state);
         let state_after_success = Arc::clone(&self.state);
@@ -72,92 +74,88 @@ impl Service<Request<hyper::Body>> for ProxyService {
             remote_addr: self.remote_addr,
         };
 
-        let mut before_res: Option<Response<Body>> = None;
-        for mw in self.middlewares.lock().unwrap().iter_mut() {
-            // Run all middlewares->before_request
-            if let Some(res) = match mw.before_request(&mut req, &context, &self.state) {
-                Err(err) => Some(Response::from(err)),
-                Ok(RespondWith(response)) => Some(response),
-                Ok(Next) => None,
-            } {
-                // Stop when an early response is wanted
-                before_res = Some(res);
-                break;
-            }
-        }
+        let client = self.client.clone();
 
-        if let Some(res) = before_res {
-            return Box::pin(future::ok(self.early_response(&context, res, &self.state)));
-        }
-
-        let res = self
-            .client
-            .request(req)
-            .map_err(move |err| {
-                for mw in mws_failure.lock().unwrap().iter_mut() {
-                    // TODO: think about graceful handling
-                    if let Err(err) = mw.request_failure(&err, &context, &state_failure) {
-                        error!("Request_failure errored: {:?}", &err);
-                    }
+        Box::pin(async move {
+            let mut before_res: Option<Response<Body>> = None;
+            for mw in mws_early.lock().await.iter_mut() {
+                // Run all middlewares->before_request
+                if let Some(res) = match mw.before_request(&mut req, &context, &state_early) {
+                    Err(err) => Some(Response::from(err)),
+                    Ok(RespondWith(response)) => Some(response),
+                    Ok(Next) => None,
+                } {
+                    // Stop when an early response is wanted
+                    before_res = Some(res);
+                    break;
                 }
-                err
-            })
-            .map_ok(move |mut res| {
-                for mw in mws_success.lock().unwrap().iter_mut() {
-                    match mw.request_success(&mut res, &context, &state_success) {
+            }
+            if let Some(mut res) = before_res {
+                for mw in mws_early.lock().await.iter_mut() {
+                    match mw
+                        .after_request(Some(&mut res), &context, &state_early)
+                        .await
+                    {
                         Err(err) => res = Response::from(err),
                         Ok(RespondWith(response)) => res = response,
                         Ok(Next) => (),
                     }
                 }
-                res
-            })
-            .map_ok_or_else(
-                move |err| {
-                    let mut res = Err(err);
-                    for mw in mws_after_success.lock().unwrap().iter_mut() {
-                        match mw.after_request(None, &context, &state_after_success) {
-                            Err(err) => res = Ok(Response::from(err)),
-                            Ok(RespondWith(response)) => res = Ok(response),
-                            Ok(Next) => (),
+                debug!("Early response is {:?}", &res);
+                return Ok(res);
+            }
+            let res = match client.request(req).await {
+                Err(err) => {
+                    for mw in mws_failure.lock().await.iter_mut() {
+                        // TODO: think about graceful handling
+                        if let Err(err) = mw.request_failure(&err, &context, &state_failure) {
+                            error!("Request_failure errored: {:?}", &err);
                         }
                     }
-                    res
-                },
-                move |mut res| {
-                    for mw in mws_after_failure.lock().unwrap().iter_mut() {
-                        match mw.after_request(Some(&mut res), &context, &state_after_failure) {
+                    Err(err)
+                }
+                Ok(mut res) => {
+                    for mw in mws_success.lock().await.iter_mut() {
+                        match mw.request_success(&mut res, &context, &state_success) {
                             Err(err) => res = Response::from(err),
                             Ok(RespondWith(response)) => res = response,
                             Ok(Next) => (),
                         }
                     }
                     Ok(res)
-                },
-            );
-
-        Box::pin(res)
+                }
+            };
+            match res {
+                Err(err) => {
+                    let mut res = Err(err);
+                    for mw in mws_after_success.lock().await.iter_mut() {
+                        match mw.after_request(None, &context, &state_after_success).await {
+                            Err(err) => res = Ok(Response::from(err)),
+                            Ok(RespondWith(response)) => res = Ok(response),
+                            Ok(Next) => (),
+                        }
+                    }
+                    res
+                }
+                Ok(mut res) => {
+                    for mw in mws_after_failure.lock().await.iter_mut() {
+                        match mw
+                            .after_request(Some(&mut res), &context, &state_after_failure)
+                            .await
+                        {
+                            Err(err) => res = Response::from(err),
+                            Ok(RespondWith(response)) => res = response,
+                            Ok(Next) => (),
+                        }
+                    }
+                    Ok(res)
+                }
+            }
+        })
     }
 }
 
 impl ProxyService {
-    fn early_response(
-        &self,
-        context: &ServiceContext,
-        mut res: Response<Body>,
-        state: &State,
-    ) -> Response<Body> {
-        for mw in self.middlewares.lock().unwrap().iter_mut() {
-            match mw.after_request(Some(&mut res), context, state) {
-                Err(err) => res = Response::from(err),
-                Ok(RespondWith(response)) => res = response,
-                Ok(Next) => (),
-            }
-        }
-        debug!("Early response is {:?}", &res);
-        res
-    }
-
     // Needed to avoid a single connection creating too much data in state
     // Since we need to identify each request in state (HashMap tuple identifier), it grows
     // for each request from the same connection
@@ -170,8 +168,10 @@ impl ProxyService {
     }
 
     pub fn new(middlewares: Middlewares, remote_addr: SocketAddr) -> Self {
+        let https = HttpsConnector::new();
+        let client = Client::builder().build::<_, hyper::Body>(https);
         ProxyService {
-            client: Client::new(),
+            client,
             state: Arc::new(Mutex::new(HashMap::new())),
             rng: SmallRng::from_entropy(),
             remote_addr,

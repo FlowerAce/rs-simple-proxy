@@ -13,6 +13,7 @@ use serde_json;
 #[derive(Clone)]
 pub struct Router {
     routes: RouterRules,
+    #[allow(dead_code)]
     name: String,
 }
 

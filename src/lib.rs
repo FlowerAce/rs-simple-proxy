@@ -11,10 +11,9 @@ use hyper::server::conn::AddrStream;
 use hyper::service::make_service_fn;
 use hyper::Server;
 use std::fmt;
-use std::{
-    convert::Infallible,
-    sync::{Arc, Mutex},
-};
+use std::{convert::Infallible, sync::Arc};
+
+use tokio::sync::Mutex;
 
 use crate::proxy::middleware::Middleware;
 use crate::proxy::service::ProxyService;
@@ -90,7 +89,7 @@ impl SimpleProxy {
         Ok(())
     }
 
-    pub fn add_middleware(&mut self, middleware: Box<dyn Middleware + Send + Sync>) {
-        self.middlewares.lock().unwrap().push(middleware)
+    pub async fn add_middleware(&mut self, middleware: Box<dyn Middleware + Send + Sync>) {
+        self.middlewares.lock().await.push(middleware)
     }
 }

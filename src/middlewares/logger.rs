@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hyper::{Body, Request, Response};
 use serde_json;
@@ -13,6 +14,7 @@ pub struct Logger;
 /// # Panics
 /// May panic if the request state has not been initialized in `before_request`.
 /// e.g If a middleware responded early before the logger in `before_request`.
+#[async_trait]
 impl Middleware for Logger {
     fn name() -> String {
         String::from("Logger")
@@ -35,7 +37,7 @@ impl Middleware for Logger {
         Ok(Next)
     }
 
-    fn after_request(
+    async fn after_request(
         &mut self,
         _res: Option<&mut Response<Body>>,
         context: &ServiceContext,

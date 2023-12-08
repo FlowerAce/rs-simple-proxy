@@ -9,6 +9,9 @@ pub enum MiddlewareResult {
 
 use self::MiddlewareResult::Next;
 
+use async_trait::async_trait;
+
+#[async_trait]
 pub trait Middleware {
     fn name() -> String
     where
@@ -67,7 +70,7 @@ pub trait Middleware {
         Ok(Next)
     }
 
-    fn after_request(
+    async fn after_request(
         &mut self,
         _res: Option<&mut Response<Body>>,
         _ctx: &ServiceContext,
